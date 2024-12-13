@@ -1,0 +1,160 @@
+x-common-env: &common-env
+  KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+  KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT"
+  KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+  KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka-node1:29093,2@kafka-node2:29093"
+  KAFKA_PROCESS_ROLES: "broker,controller"
+  KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+  KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 2
+  KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 2
+  CLUSTER_ID: "cWto7WRmj2RmqR9chE9SaA"
+  KAFKA_LOG_DIRS: "/tmp/kraft-combined-logs"
+  KAFKA_METRIC_REPORTERS: io.confluent.metrics.reporter.ConfluentMetricsReporter
+  CONFLUENT_METRICS_REPORTER_TOPIC_REPLICAS: 1
+  CONFLUENT_METRICS_ENABLE: "true"
+  CONFLUENT_SUPPORT_CUSTOMER_ID: anonymous
+
+x-common-healthcheck: &common-healthcheck
+  interval: 10s
+  timeout: 5s
+  retries: 5
+
+services:
+  kafka-node1:
+    image: confluentinc/cp-server
+    container_name: kafka-node1
+    hostname: kafka-node1
+    ports:
+      - "9092:9092"
+    environment:
+      <<: *common-env
+      KAFKA_NODE_ID: "1"
+      KAFKA_LISTENERS: "INTERNAL://kafka-node1:29092,CONTROLLER://kafka-node1:29093,EXTERNAL://0.0.0.0:9092"
+      KAFKA_ADVERTISED_LISTENERS: "INTERNAL://kafka-node1:29092,EXTERNAL://localhost:9092"
+      CONFLUENT_METRICS_REPORTER_BOOTSTRAP_SERVERS: "kafka-node1:29092"
+    healthcheck:
+      <<: *common-healthcheck
+      test: ["CMD", "bash", "-c", "echo 'ruok' | nc localhost 9092"]
+    networks:
+      - data-pipeline-cluster
+
+  kafka-node2:
+    image: confluentinc/cp-server
+    container_name: kafka-node2
+    hostname: kafka-node2
+    ports:
+      - "9093:9092"
+    environment:
+      <<: *common-env
+      KAFKA_NODE_ID: "2"
+      KAFKA_LISTENERS: "INTERNAL://kafka-node2:29092,CONTROLLER://kafka-node2:29093,EXTERNAL://0.0.0.0:9093"
+      KAFKA_ADVERTISED_LISTENERS: "INTERNAL://kafka-node2:29092,EXTERNAL://localhost:9093"
+      CONFLUENT_METRICS_REPORTER_BOOTSTRAP_SERVERS: "kafka-node1:29092"
+    healthcheck:
+      <<: *common-healthcheck
+      test: ["CMD", "bash", "-c", "echo 'ruok' | nc localhost 9093"]
+    networks:
+      - data-pipeline-cluster
+
+  schema-registry:
+    image: confluentinc/cp-schema-registry
+    hostname: schema-registry
+    container_name: schema-registry
+    depends_on:
+      - kafka-node1
+      - kafka-node2
+    environment:
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: "kafka-node1:29092,kafka-node2:29092"
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_LISTENERS: "http://0.0.0.0:8081"
+    ports:
+      - "8081:8081"  # Expose Schema Registry for external access
+    networks:
+      - data-pipeline-cluster
+
+
+  control-center:
+    image: confluentinc/cp-enterprise-control-center
+    hostname: control-center
+    container_name: control-center
+    depends_on:
+      - schema-registry
+    ports:
+      - "9021:9021"
+    environment:
+      - CONTROL_CENTER_BOOTSTRAP_SERVERS=kafka-node1:29092,kafka-node2:29092
+      - CONTROL_CENTER_SCHEMA_REGISTRY_URL=http://schema-registry:8081
+      - CONTROL_CENTER_REPLICATION_FACTOR=1
+      - CONTROL_CENTER_TOPICS_PARTITIONS=1
+      - CONTROL_CENTER_MONITORING_INTERCEPTOR_TOPIC_PARTITIONS=1
+      - CONFLUENT_METRICS_TOPIC_REPLICATION=1
+      - CONFLUENT_METRICS_ENABLE=false
+      - PORT=9021
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9021/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - data-pipeline-cluster
+
+  minio:
+    image: minio/minio
+    hostname: minio
+    container_name: minio
+    ports:
+      - "9090:9000"
+      - "9091:9091"
+    environment:
+      MINIO_ROOT_USER: "minioadmin"
+      MINIO_ROOT_PASSWORD: "minioadmin"
+    command: server /data --console-address ":9091"
+    networks:
+      - data-pipeline-cluster
+
+  mc-init:
+    image: minio/mc
+    container_name: mc-init
+    entrypoint: /bin/sh
+    command: [
+      "-c", 
+      "sleep 5 && \
+       mc config host add dmlminio http://minio:9000 minioadmin minioadmin && \
+       mc mb dmlminio/bronze"
+    ]
+    depends_on:
+      - minio
+    networks:
+      - data-pipeline-cluster
+
+
+  spark-master:
+    image: bitnami/spark:latest
+    command: bin/spark-class org.apache.spark.deploy.master.Master
+    ports:
+      - "8082:8080"  # Host:Container
+      - "7077:7077"
+    networks:
+      - data-pipeline-cluster
+
+  
+  spark-worker:
+    image: bitnami/spark:latest
+    command: bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    depends_on:
+      - spark-master
+    volumes:
+      - ./jobs:/opt/bitnami/spark/jobs
+    environment:
+      SPARK_MODE: worker
+      SPARK_WORKER_CORES: 2
+      SPARK_WORKER_MEMORY: 1g
+      SPARK_MASTER_URL: spark://spark-master:7077
+    networks:
+      - data-pipeline-cluster
+
+
+networks:
+  data-pipeline-cluster:
+    name: data-pipeline-cluster
+
